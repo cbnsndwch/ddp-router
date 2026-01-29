@@ -196,7 +196,7 @@ while let Ok(event) = receiver.recv().await {
 
 ### Prerequisites
 
-- Rust 1.70+ (edition 2021)
+- Rust 1.79.0+ (edition 2021)
 - MongoDB 4.0+ (for Change Streams support)
 - A Meteor application (for full functionality)
 
