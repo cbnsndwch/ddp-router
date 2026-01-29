@@ -16,6 +16,8 @@ A high-performance Rust implementation of MeteorJS's real-time data synchronizat
 - [Supported Query Features](#supported-query-features)
 - [Limitations and Known Issues](#limitations-and-known-issues)
 - [License](#license)
+- [Contributing](#contributing)
+- [Acknowledgments](#acknowledgments)
 
 ---
 
