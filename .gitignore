@@ -1,1 +1,7 @@
+#Build output
 /target
+
+# Local files
+/.local
+/.github
+/.vscode
