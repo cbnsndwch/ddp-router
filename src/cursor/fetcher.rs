@@ -205,6 +205,17 @@ async fn process(
                 return Ok(false);
             }
 
+            if let Some(index) = {
+                let id = document.get("_id");
+                documents.iter().position(|x| x.get("_id") == id)
+            } {
+                if description.limit().is_some() {
+                    documents.remove(index);
+                } else {
+                    documents.swap_remove(index);
+                }
+            }
+
             if let Some(limit) = description.limit() {
                 let index = documents
                     .binary_search_by(|x| viewer.sorter.cmp(x, &document))
@@ -420,4 +431,48 @@ mod tests {
             }
         ]
     );
+
+    #[test]
+    async fn duplicate_insert_reuses_existing_document() -> Result<(), Error> {
+        let description = CursorDescription::deserialize(
+            json! {{"collectionName": "x", "selector": {}, "options": {}}},
+        )?;
+        let viewer = CursorViewer::try_from(&description)?;
+        let (sender, mut receiver) = channel(64);
+        let mergeboxes = Arc::new(Mutex::new({
+            let mut mergeboxes = Mergeboxes::default();
+            mergeboxes.insert_mergebox(1, &Arc::new(Mutex::new(Mergebox::new(sender))));
+            mergeboxes
+        }));
+
+        let mut documents = vec![json_doc! {"_id": 1, "a": 1}];
+        mergeboxes
+            .lock()
+            .await
+            .insert("x".to_owned(), json!(1), json_doc! {"a": 1})
+            .await?;
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(DDPMessage::Added {
+                collection: "x".to_owned(),
+                id: json!(1),
+                fields: Some(json_doc! {"a": 1}),
+                cleared: None,
+            })
+        );
+
+        process(
+            Event::Insert(doc! {"_id": 1, "a": 1}),
+            &description,
+            &mut documents,
+            &mergeboxes,
+            &viewer,
+        )
+        .await?;
+
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(documents, vec![json_doc! {"_id": 1, "a": 1}]);
+
+        Ok(())
+    }
 }

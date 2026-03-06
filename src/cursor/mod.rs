@@ -7,7 +7,7 @@ pub use description::CursorDescription;
 use crate::drop_handle::DropHandle;
 use crate::mergebox::{Mergebox, Mergeboxes};
 use crate::watcher::Watcher;
-use anyhow::{Context, Error};
+use anyhow::{anyhow, Context, Error};
 use fetcher::CursorFetcher;
 use futures_util::FutureExt;
 use mongodb::Database;
@@ -57,6 +57,11 @@ impl Cursor {
         if is_first {
             println!("\x1b[0;32mmongo\x1b[0m start({:?})", self.description);
 
+            // Subscribe before the initial fetch so writes that land while the
+            // query is running are buffered in the receiver instead of being
+            // lost in the fetch/watch gap.
+            let receiver_or_interval = self.fetcher.read().await.watch().await;
+
             // Run initial query.
             let mergeboxes = self.mergeboxes.clone();
             self.fetcher
@@ -70,10 +75,23 @@ impl Cursor {
             let fetcher = self.fetcher.clone();
             let task = async move {
                 // Start an event processor or fall back to pooling.
-                let receiver_or_interval = fetcher.read().await.watch().await;
                 match receiver_or_interval {
                     Ok(mut receiver) => loop {
-                        let event = receiver.recv().await?;
+                        let event = match receiver.recv().await {
+                            Ok(event) => event,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                return Err(anyhow!("change stream receiver closed"));
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                fetcher
+                                    .write()
+                                    .await
+                                    .fetch(&mergeboxes)
+                                    .await
+                                    .context("Cursor::start (lagged refetch)")?;
+                                continue;
+                            }
+                        };
                         fetcher
                             .write()
                             .await
