@@ -48,18 +48,21 @@ impl From<ChangeStreamEvent<Document>> for Event {
 pub struct Watcher {
     change_streams: BTreeMap<String, Arc<Mutex<Sender<Event>>>>,
     database: Database,
+    full_document: Option<FullDocumentType>,
 }
 
 impl Watcher {
-    pub fn new(database: Database) -> Self {
+    pub fn new(database: Database, full_document: Option<FullDocumentType>) -> Self {
         Self {
             change_streams: BTreeMap::new(),
             database,
+            full_document,
         }
     }
 
     fn start(&self, collection: String, sender: Arc<Mutex<Sender<Event>>>) {
         let database = self.database.clone();
+        let full_document = self.full_document.clone();
         let task = async move {
             // The current Meteor's Oplog tailing has to refetch a document by
             // `_id` when a document outside of the current documents set is
@@ -72,9 +75,7 @@ impl Watcher {
             ];
 
             let options = ChangeStreamOptions::builder()
-                // TODO: Ideally we would use `Required` here, but it has to be
-                // enabled on the database level. It should be configurable.
-                .full_document(Some(FullDocumentType::UpdateLookup))
+                .full_document(full_document)
                 .build();
 
             let mut change_stream = database

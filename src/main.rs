@@ -15,6 +15,7 @@ mod watcher;
 
 use anyhow::{Context, Error};
 use futures_util::FutureExt;
+use mongodb::options::FullDocumentType;
 use mongodb::Client;
 use session::start_session;
 use settings::Settings;
@@ -45,7 +46,18 @@ async fn main() -> Result<(), Error> {
     println!("\x1b[0;33mrouter\x1b[0m Connected to MongoDB");
 
     let mut session_id_counter = 0;
-    let watcher = Watcher::new(database.clone());
+    let full_document = match settings.mongo.full_document.as_deref() {
+        Some("default") => None,
+        Some("updateLookup") => Some(FullDocumentType::UpdateLookup),
+        Some("whenAvailable") => Some(FullDocumentType::WhenAvailable),
+        Some("required") => Some(FullDocumentType::Required),
+        None => Some(FullDocumentType::UpdateLookup),
+        Some(s) => {
+            eprintln!("Warning: Unknown full_document value '{}'. Ignoring.", s);
+            Some(FullDocumentType::UpdateLookup)
+        }
+    };
+    let watcher = Watcher::new(database.clone(), full_document);
     let subscriptions = Arc::new(Mutex::new(Subscriptions::new(database, watcher)));
 
     loop {

@@ -9,6 +9,7 @@ pub struct Meteor {
 #[derive(Deserialize)]
 pub struct Mongo {
     pub url: String,
+    pub full_document: Option<String>,
 }
 
 #[derive(Deserialize)]
