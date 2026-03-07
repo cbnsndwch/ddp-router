@@ -2,42 +2,155 @@ use super::description::CursorDescription;
 use super::viewer::CursorViewer;
 use crate::ejson::into_ejson_document;
 use crate::mergebox::{Mergebox, Mergeboxes};
-use crate::watcher::{Event, Watcher};
+use crate::watcher::{Event, WatchSubscription, Watcher};
 use anyhow::{anyhow, Context, Error};
-use bson::Document;
+use bson::{Document, Timestamp};
 use futures_util::{StreamExt, TryStreamExt};
 use mongodb::Database;
 use serde_json::{Map, Value};
 use std::mem::{replace, take};
 use std::sync::Arc;
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::Mutex;
 use tokio::time::{interval_at, Duration, Instant, Interval};
+
+#[derive(Debug, Eq, PartialEq)]
+enum FetchPhase {
+    Querying,
+    Replaying,
+    Steady,
+}
+
+#[derive(Debug)]
+struct FetchState {
+    buffered_events: Vec<Event>,
+    phase: FetchPhase,
+}
+
+impl Default for FetchState {
+    fn default() -> Self {
+        Self {
+            buffered_events: Vec::default(),
+            phase: FetchPhase::Steady,
+        }
+    }
+}
+
+impl FetchState {
+    fn buffer(&mut self, event: Event) {
+        self.buffered_events.push(event);
+    }
+
+    fn clear(&mut self) {
+        self.buffered_events.clear();
+    }
+
+    fn finish_steady(&mut self) {
+        self.phase = FetchPhase::Steady;
+    }
+
+    fn start_querying(&mut self) {
+        self.buffered_events.clear();
+        self.phase = FetchPhase::Querying;
+    }
+
+    fn start_replay(&mut self) {
+        self.phase = FetchPhase::Replaying;
+    }
+
+    fn take_buffered(&mut self) -> Vec<Event> {
+        take(&mut self.buffered_events)
+    }
+}
+
+enum DrainOutcome {
+    Lagged,
+    Ready,
+    Resync(Option<Timestamp>),
+}
 
 pub struct CursorFetcher {
     database: Database,
     description: CursorDescription,
     documents: Vec<Map<String, Value>>,
+    fetch_state: FetchState,
     viewer: Option<CursorViewer>,
     watcher: Arc<Mutex<Watcher>>,
 }
 
 impl CursorFetcher {
-    pub async fn fetch(&mut self, mergeboxes: &Arc<Mutex<Mergeboxes>>) -> Result<(), Error> {
+    async fn drain_buffered_events(
+        &mut self,
+        receiver: &mut Receiver<Event>,
+    ) -> Result<DrainOutcome, Error> {
+        loop {
+            match receiver.try_recv() {
+                Ok(Event::Resync(boundary)) => {
+                    self.fetch_state.clear();
+                    return Ok(DrainOutcome::Resync(boundary));
+                }
+                Ok(event) => self.fetch_state.buffer(event),
+                Err(TryRecvError::Closed) => {
+                    return Err(anyhow!("change stream receiver closed"));
+                }
+                Err(TryRecvError::Empty) => return Ok(DrainOutcome::Ready),
+                Err(TryRecvError::Lagged(_)) => {
+                    self.fetch_state.clear();
+                    return Ok(DrainOutcome::Lagged);
+                }
+            }
+        }
+    }
+
+    async fn fetch_documents(
+        &self,
+        boundary: Option<Timestamp>,
+    ) -> Result<Vec<Map<String, Value>>, Error> {
+        let collection = self
+            .database
+            .collection::<Document>(&self.description.collection);
+
+        if let Some(boundary) = boundary {
+            let mut session = collection.client().start_session(None).await?;
+            session.advance_operation_time(boundary);
+
+            let mut cursor = collection
+                .find_with_session(
+                    Some(self.description.selector.clone()),
+                    Some(self.description.as_find_options()),
+                    &mut session,
+                )
+                .await?;
+
+            cursor
+                .stream(&mut session)
+                .map(|maybe_document| maybe_document.map(into_ejson_document))
+                .try_collect()
+                .await
+                .map_err(Into::into)
+        } else {
+            collection
+                .find(
+                    Some(self.description.selector.clone()),
+                    Some(self.description.as_find_options()),
+                )
+                .await?
+                .map(|maybe_document| maybe_document.map(into_ejson_document))
+                .try_collect()
+                .await
+                .map_err(Into::into)
+        }
+    }
+
+    pub async fn fetch_snapshot(
+        &mut self,
+        mergeboxes: &Arc<Mutex<Mergeboxes>>,
+        boundary: Option<Timestamp>,
+    ) -> Result<(), Error> {
         println!("\x1b[0;32mmongo\x1b[0m fetch({:?})", self.description);
 
-        let mut documents: Vec<_> = self
-            .database
-            .collection::<Document>(&self.description.collection)
-            .find(
-                Some(self.description.selector.clone()),
-                Some(self.description.as_find_options()),
-            )
-            .await?
-            .map(|maybe_document| maybe_document.map(into_ejson_document))
-            .try_collect()
-            .await?;
-
+        let mut documents = self.fetch_documents(boundary).await?;
         let mut mergeboxes = mergeboxes.lock().await;
 
         for document in &mut documents {
@@ -62,6 +175,36 @@ impl CursorFetcher {
         Ok(())
     }
 
+    pub async fn handle_event(
+        &mut self,
+        event: Event,
+        receiver: &mut Receiver<Event>,
+        mergeboxes: &Arc<Mutex<Mergeboxes>>,
+    ) -> Result<(), Error> {
+        match event {
+            Event::Resync(boundary) => self.refetch_and_replay(receiver, mergeboxes, boundary).await,
+            event => {
+                let refetch = process(
+                    event,
+                    &self.description,
+                    &mut self.documents,
+                    mergeboxes,
+                    self.viewer.as_ref().unwrap(),
+                )
+                .await
+                .context("CursorFetcher::handle_event")?;
+
+                if refetch {
+                    self.refetch_and_replay(receiver, mergeboxes, None)
+                        .await
+                        .context("CursorFetcher::handle_event (refetch)")?;
+                }
+
+                Ok(())
+            }
+        }
+    }
+
     pub fn new(
         database: Database,
         description: CursorDescription,
@@ -79,33 +222,61 @@ impl CursorFetcher {
             database,
             description,
             documents: Vec::default(),
+            fetch_state: FetchState::default(),
             viewer,
             watcher,
         }
     }
 
-    pub async fn process(
+    pub async fn refetch_and_replay(
         &mut self,
-        event: Event,
+        receiver: &mut Receiver<Event>,
         mergeboxes: &Arc<Mutex<Mergeboxes>>,
+        mut boundary: Option<Timestamp>,
     ) -> Result<(), Error> {
-        let refetch = process(
-            event,
-            &self.description,
-            &mut self.documents,
-            mergeboxes,
-            self.viewer.as_ref().unwrap(),
-        )
-        .await
-        .context("CursorFetcher::process")?;
-
-        if refetch {
-            self.fetch(mergeboxes)
+        'retry: loop {
+            self.fetch_state.start_querying();
+            self.fetch_snapshot(mergeboxes, boundary.clone())
                 .await
-                .context("CursorFetcher::process (refetch)")?;
-        }
+                .context("CursorFetcher::refetch_and_replay (fetch)")?;
 
-        Ok(())
+            match self
+                .drain_buffered_events(receiver)
+                .await
+                .context("CursorFetcher::refetch_and_replay (drain)")?
+            {
+                DrainOutcome::Lagged => {
+                    boundary = None;
+                    continue;
+                }
+                DrainOutcome::Ready => {}
+                DrainOutcome::Resync(next_boundary) => {
+                    boundary = next_boundary;
+                    continue;
+                }
+            }
+
+            self.fetch_state.start_replay();
+            for event in self.fetch_state.take_buffered() {
+                let refetch = process(
+                    event,
+                    &self.description,
+                    &mut self.documents,
+                    mergeboxes,
+                    self.viewer.as_ref().unwrap(),
+                )
+                .await
+                .context("CursorFetcher::refetch_and_replay (replay)")?;
+
+                if refetch {
+                    boundary = None;
+                    continue 'retry;
+                }
+            }
+
+            self.fetch_state.finish_steady();
+            return Ok(());
+        }
     }
 
     pub async fn register(&self, mergebox: &Arc<Mutex<Mergebox>>) -> Result<(), Error> {
@@ -121,12 +292,20 @@ impl CursorFetcher {
         Ok(())
     }
 
-    pub async fn watch(&self) -> Result<Receiver<Event>, Interval> {
+    pub async fn watch(&self) -> Result<WatchSubscription, Interval> {
         if self.viewer.is_some() {
             let mut watcher = self.watcher.lock().await;
-            Ok(watcher.watch(self.description.collection.clone()).await)
+            match watcher.watch(self.description.collection.clone()).await {
+                Ok(subscription) => Ok(subscription),
+                Err(error) => {
+                    println!("\x1b[0;32mmongo\x1b[0m \x1b[0;31m{error:?}\x1b[0m");
+
+                    let interval = self.description.polling_interval_ms.unwrap_or(10_000);
+                    let duration = Duration::from_millis(interval);
+                    Err(interval_at(Instant::now() + duration, duration))
+                }
+            }
         } else {
-            // Meteor's default.
             let interval = self.description.polling_interval_ms.unwrap_or(10_000);
             let duration = Duration::from_millis(interval);
             Err(interval_at(Instant::now() + duration, duration))
@@ -252,6 +431,7 @@ async fn process(
 
             Ok(false)
         }
+        Event::Resync(_) => Ok(true),
         Event::Update(document) => {
             let mut document = into_ejson_document(document);
             let is_matching = viewer.matcher.matches(&document);
@@ -266,7 +446,6 @@ async fn process(
                         .binary_search_by(|x| viewer.sorter.cmp(x, &document))
                         .unwrap_or_else(|index| index);
 
-                    // Skip newly matching documents that don't fit in `limit`.
                     if index == limit {
                         return Ok(false);
                     }
@@ -306,7 +485,6 @@ async fn process(
 
                 let mut document = match description.limit() {
                     Some(limit) => {
-                        // If we fall below the limit, we need to refetch.
                         if limit == documents.len() {
                             return Ok(true);
                         };
@@ -333,7 +511,7 @@ async fn process(
 
 #[cfg(test)]
 mod tests {
-    use super::{process, CursorDescription, CursorViewer};
+    use super::{process, CursorDescription, CursorViewer, FetchPhase, FetchState};
     use crate::ddp::DDPMessage;
     use crate::mergebox::{Mergebox, Mergeboxes};
     use crate::watcher::Event;
@@ -431,6 +609,35 @@ mod tests {
             }
         ]
     );
+
+    #[test]
+    async fn fetch_state_tracks_query_replay_steady_transitions() {
+        let mut fetch_state = FetchState::default();
+        assert_eq!(fetch_state.phase, FetchPhase::Steady);
+
+        fetch_state.start_querying();
+        fetch_state.buffer(Event::Clear);
+        assert_eq!(fetch_state.phase, FetchPhase::Querying);
+        assert_eq!(fetch_state.buffered_events.len(), 1);
+
+        fetch_state.start_replay();
+        assert_eq!(fetch_state.phase, FetchPhase::Replaying);
+
+        assert_eq!(fetch_state.take_buffered(), vec![Event::Clear]);
+        fetch_state.finish_steady();
+        assert_eq!(fetch_state.phase, FetchPhase::Steady);
+    }
+
+    #[test]
+    async fn fetch_state_restart_clears_buffer() {
+        let mut fetch_state = FetchState::default();
+        fetch_state.start_querying();
+        fetch_state.buffer(Event::Clear);
+        fetch_state.start_querying();
+
+        assert_eq!(fetch_state.phase, FetchPhase::Querying);
+        assert!(fetch_state.buffered_events.is_empty());
+    }
 
     #[test]
     async fn duplicate_insert_reuses_existing_document() -> Result<(), Error> {

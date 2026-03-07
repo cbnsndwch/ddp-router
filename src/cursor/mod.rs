@@ -57,19 +57,32 @@ impl Cursor {
         if is_first {
             println!("\x1b[0;32mmongo\x1b[0m start({:?})", self.description);
 
-            // Subscribe before the initial fetch so writes that land while the
-            // query is running are buffered in the receiver instead of being
-            // lost in the fetch/watch gap.
-            let receiver_or_interval = self.fetcher.read().await.watch().await;
-
-            // Run initial query.
             let mergeboxes = self.mergeboxes.clone();
-            self.fetcher
-                .write()
-                .await
-                .fetch(&mergeboxes)
-                .await
-                .context("Cursor::start")?;
+            let watch_result = self.fetcher.read().await.watch().await;
+            let receiver_or_interval = match watch_result {
+                Ok(mut subscription) => {
+                    self.fetcher
+                        .write()
+                        .await
+                        .refetch_and_replay(
+                            &mut subscription.receiver,
+                            &mergeboxes,
+                            subscription.start_at_operation_time,
+                        )
+                        .await
+                        .context("Cursor::start")?;
+                    Ok(subscription.receiver)
+                }
+                Err(interval) => {
+                    self.fetcher
+                        .write()
+                        .await
+                        .fetch_snapshot(&mergeboxes, None)
+                        .await
+                        .context("Cursor::start")?;
+                    Err(interval)
+                }
+            };
 
             // Start background task.
             let fetcher = self.fetcher.clone();
@@ -86,7 +99,7 @@ impl Cursor {
                                 fetcher
                                     .write()
                                     .await
-                                    .fetch(&mergeboxes)
+                                    .refetch_and_replay(&mut receiver, &mergeboxes, None)
                                     .await
                                     .context("Cursor::start (lagged refetch)")?;
                                 continue;
@@ -95,7 +108,7 @@ impl Cursor {
                         fetcher
                             .write()
                             .await
-                            .process(event, &mergeboxes)
+                            .handle_event(event, &mut receiver, &mergeboxes)
                             .await
                             .context("Cursor::start (process)")?;
                     },
@@ -104,7 +117,7 @@ impl Cursor {
                         fetcher
                             .write()
                             .await
-                            .fetch(&mergeboxes)
+                            .fetch_snapshot(&mergeboxes, None)
                             .await
                             .context("Cursor::start (refetch)")?;
                     },
