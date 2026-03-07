@@ -64,4 +64,15 @@ Meteor.startup(async () => {
   Meteor.publish("links", function () {
     return LinksCollection.find();
   });
+
+  // Expose a method to quickly add mock data
+  Meteor.methods({
+    async 'links.insertMock'() {
+      const id = Math.random().toString(36).substring(7);
+      await insertLink({
+        title: `Mock Link ${id}`,
+        url: `https://example.com/mock/${id}`
+      });
+    }
+  });
 });
